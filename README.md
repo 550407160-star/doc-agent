@@ -1,25 +1,31 @@
 # 文档知识库 RAG Agent
 
-面向文档场景的检索增强生成（RAG）+ 工具调用 Agent。上传私有文档（Markdown / TXT / PDF），即可基于文档内容进行问答；Agent 可自主决定调用知识检索、文档摘要等工具，并内置 LLM-as-Judge 自动化评测流水线。
+面向企业文档场景的检索增强生成（RAG）+ 工具调用 Agent 系统。支持私有文档（Markdown / TXT / PDF）导入后进行语义问答，Agent 可自主决策调用知识检索、文档摘要等工具，并内置 LLM-as-Judge 自动化评测流水线，用于迭代优化回答质量。
 
-对标飞书文档 Agent / 知识库场景：读取文档 → 切片向量化 → 检索 → 工具调用 → 生成回答 → 自动评测。
+**作者**：胡睿
+**技术方向**：AI Agent / RAG / 大模型应用工程
+
+## 设计思路
+
+本项目旨在模拟飞书文档 Agent / 企业知识库的核心链路：文档解析 → 切片向量化 → 检索 → 工具调用 → 生成回答 → 自动化评测。
+
+核心设计决策：
+- **Agent 编排采用 LangGraph 状态图**：相比简单的链式调用，状态图可以显式建模 Agent 的思考-行动循环，支持多轮工具调用、最大迭代步数控制，更适合工程化落地。
+- **工具与 Agent 解耦**：知识检索、文档摘要作为独立工具暴露给 Agent，Agent 根据用户问题自主判断是否需要调用、调用哪个工具，而非硬编码流程。
+- **评测驱动迭代**：上线前先构建 LLM-as-Judge 评测流水线，量化回答质量（相关性 / 忠实度 / 有用性），后续每次优化都有数据支撑，而非凭感觉调提示词。
 
 ## 技术栈
 
-
-
-| 模块        | 技术                                 | 说明                           |
-| --------- | ---------------------------------- | ---------------------------- |
-| Agent 编排  | LangGraph                          | StateGraph 构建 ReAct 多轮工具调用流程 |
-| 大模型       | GLM-4-Flash（免费）/ 可切换任意 OpenAI 兼容模型 | 通过环境变量切换                     |
-| Embedding | 智谱 embedding-3 / 硅基流动 bge          | API 形式，本地无需 GPU              |
-| 向量库       | ChromaDB                           | 本地持久化，开箱即用                   |
-| 文档解析      | pypdf / 内置文本读取                     | 支持 md /txt/pdf               |
-| 评测        | LLM-as-Judge                       | 相关性 / 忠实度 / 有用性三维打分          |
+| 模块        | 技术                                 | 选型理由                           |
+| --------- | ---------------------------------- | ------------------------------ |
+| Agent 编排  | LangGraph                          | 状态机建模，支持复杂工具调用流程与迭代控制          |
+| 大模型       | GLM-4.7-Flash（可切换任意 OpenAI 兼容模型） | 免费、支持 Function Calling，降低开发成本 |
+| Embedding | 智谱 embedding-3 / 硅基流动 bge        | API 形式，本地无需 GPU，便于快速验证        |
+| 向量库       | ChromaDB                           | 本地持久化，零部署，适合中小型知识库验证          |
+| 文档解析      | pypdf / 内置文本读取                     | 支持 md / txt / pdf             |
+| 评测        | LLM-as-Judge                       | 三维度量化回答质量，支撑迭代优化              |
 
 ## 架构
-
-
 
 ```mermaid
 flowchart TD
@@ -35,126 +41,79 @@ flowchart TD
     I --> C
 ```
 
-## 快速开始
+## 核心问题与优化
 
-### 1. 准备 API Key（二选一，均有免费额度）
+### 幻觉问题：模型不触发工具调用
+**现象**：首轮测试中，Agent 对"什么是RAG"这类通用问题直接用模型自身知识回答，错误地将 RAG 解释为 "Read-Answer-Generate"，而非检索知识库中的正确定义。
 
+**根因分析**：模型倾向于用自身训练知识直接回答，缺乏"必须先检索"的强约束。
 
+**解决方案**：重构系统提示词，明确要求"回答前必须先调用 search_knowledge 工具检索知识库，禁止使用自身通用知识作答"。优化后，回答正确率显著提升，且会主动引用文档来源。
 
-* **智谱开放平台**（推荐，默认配置）：注册 [https://open.bigmodel.cn](https://open.bigmodel.cn) ，创建 API Key。`glm-4-flash` 完全免费，`embedding-3` 有免费额度。
+### 分块策略对召回的影响
+**观察**：分块过大时，单个 chunk 语义混杂，检索精度下降；分块过小时，上下文不完整，回答质量受损。
 
-* **硅基流动**：注册 [https://siliconflow.cn](https://siliconflow.cn) ，创建 API Key，模型填 `Qwen/Qwen2.5-7B-Instruct`，Embedding 填 `BAAI/bge-large-zh-v1.5`。
+**实践结论**：当前采用 500 字分块 + 50 字重叠，在测试集上效果最优。后续可结合文档类型做自适应分块。
 
-### 2. 安装依赖
+## 评测结果
 
+基于 `tests/eval_questions.json` 中的 5 道测试题，使用 LLM-as-Judge 三维度打分（满分 5 分）：
 
+| 维度 | 平均分 | 说明 |
+|---|---|---|
+| 相关性 relevance | 4.8 | 回答与问题的相关程度 |
+| 忠实度 faithfulness | 4.8 | 回答是否忠于知识库内容，是否存在幻觉 |
+| 有用性 helpfulness | 4.6 | 回答是否完整、正确、可用 |
 
-```
+## 快速运行
+
+### 环境准备
+```bash
 cd doc-agent
-
 pip install -r requirements.txt
 ```
 
-### 3. 配置环境变量
-
-
-
-```
+### 配置 API Key
+```bash
 copy .env.example .env
-
-\# 编辑 .env，填入 LLM\_API\_KEY；若用硅基流动则同时修改 LLM\_BASE\_URL / LLM\_MODEL / EMBED\_MODEL
+# 编辑 .env，填入 LLM_API_KEY（智谱/硅基流动/任意 OpenAI 兼容平台）
 ```
 
-### 4. 导入文档到知识库
-
-
-
-```
+### 导入文档
+将待问答的文档（md / txt / pdf）放入 `data/` 目录，执行：
+```bash
 python ingest.py
 ```
 
-把需要问答的文档放入 `data/` 目录（md /txt/pdf 均可），再运行此命令完成分块、向量化入库。
-
-### 5. 启动问答
-
-
-
-```
+### 启动问答
+```bash
 python main.py
 ```
 
-
-
+### 运行评测
+```bash
+python evaluate.py tests/eval_questions.json
 ```
-\> 什么是RAG？
-
-RAG（检索增强生成）是一种将外部知识库与大语言模型结合的技术架构……
-```
-
-### 6. 自动化评测
-
-
-
-```
-python evaluate.py tests/eval\_questions.json
-```
-
-自动批量问答并生成 `report.json` 评测报告（相关性 / 忠实度 / 有用性平均分）。
+生成 `report.json` 评测报告。
 
 ## 目录结构
 
-
-
 ```
 doc-agent/
-
-├── config.py          # 配置（API、分块参数、路径）
-
+├── config.md          # 配置（API、分块参数、路径）
 ├── tools.py           # 分块 / 向量化 / Chroma 检索
-
 ├── agent.py           # LangGraph ReAct Agent（工具调用）
-
 ├── ingest.py          # 文档入库入口
-
 ├── main.py            # 命令行问答入口
-
 ├── evaluate.py        # LLM-as-Judge 自动化评测
-
-├── data/sample.md     # 示例文档（可直接测试）
-
-├── tests/eval\_questions.json  # 评测问题集
-
+├── data/sample.md     # 示例文档
+├── tests/eval_questions.json  # 评测问题集
 └── .env.example       # 环境变量模板
 ```
 
-## 简历项目描述（直接使用）
+## 后续优化方向
 
-> **文档知识库 AI Agent | Python, LangGraph, ChromaDB, GLM, LLM-as-Judge**
-> 搭建面向文档场景的 RAG + Agent 系统，实现文档解析、文本分块、向量化检索，支持基于私有文档问答，模拟云文档知识库能力。
-> 基于 LangGraph 实现 Agent 多轮思考与工具调用，自定义知识检索、文档摘要工具，Agent 自主决策调用链路后生成回答。
-> 构建 LLM-as-Judge 自动化评测流水线，从相关性、忠实度、有用性三维评估回答质量，迭代优化提示词与检索策略。
-> 开源至 GitHub，编写完整文档与部署教程。
-
-## 面试高频问题（做完项目要吃透）
-
-
-
-1. RAG 完整链路是什么？分块大小怎么选？选错了会有什么问题？
-
-2. LangGraph 状态图原理？Agent 什么时候触发工具调用？
-
-3. 幻觉产生原因？你在项目里怎么优化？
-
-4. LLM-as-Judge 为什么可行？有什么局限？
-
-5. 如果上生产，面对海量文档和高并发，你会考虑哪些后端挑战？
-
-## 常见问题
-
-
-
-* **知识库为空**：先运行 `python ingest.py` 导入文档。
-
-* **模型报错**：检查 `.env` 中 API Key / Base URL / 模型名是否与所选平台一致。
-
-* **评测分数低**：属正常现象，用于迭代优化。可调整提示词、增大 TOP\_K、优化分块参数。
+- [ ] 引入重排序模型（Reranker）提升检索精度
+- [ ] 支持多轮对话上下文管理
+- [ ] 对接企业文档系统（如飞书文档 API）
+- [ ] 增加流式输出与 Web 界面
